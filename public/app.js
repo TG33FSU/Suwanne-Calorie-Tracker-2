@@ -119,6 +119,8 @@ function render() {
   renderSummary();
   renderSyncStatus();
   renderFavorites();
+  renderMenuPreview();
+  renderInsight();
 }
 
 function renderDiary() {
@@ -348,17 +350,55 @@ function shiftDate(delta) {
 document.getElementById("syncMenu").addEventListener("click", async () => {
   const btn = document.getElementById("syncMenu");
   const label = document.getElementById("syncLabel");
+  const statusEl = document.getElementById("syncStatus");
   btn.disabled = true;
-  label.textContent = "Syncing… this can take up to 30s";
+
   try {
-    state.menu = await api("/api/menu/refresh", { method: "POST" });
-    renderSyncStatus();
+    // Kick the scrape off — this returns almost instantly now; the actual
+    // scraping happens in the background on the server so we don't hold
+    // open one long request (which is what was causing the 502 — Render's
+    // proxy kills requests that stay open for minutes, even though the
+    // scrape itself was still working fine).
+    const started = await api("/api/menu/refresh", { method: "POST" });
+    if (started.error && !started.status) {
+      throw new Error(started.error);
+    }
   } catch (err) {
-    document.getElementById("syncStatus").textContent = `Sync failed: ${err.message}`;
-  } finally {
-    btn.disabled = false;
-    label.textContent = "Sync Suwannee Room menu";
+    // A 409 here just means one's already running — that's fine, fall
+    // through to polling instead of treating it as a failure.
+    if (!/already in progress/i.test(err.message)) {
+      statusEl.textContent = `Sync failed: ${err.message}`;
+      btn.disabled = false;
+      return;
+    }
   }
+
+  let elapsed = 0;
+  label.textContent = "Syncing…";
+  const poll = setInterval(async () => {
+    elapsed += 3;
+    try {
+      const status = await api("/api/menu/refresh/status");
+      label.textContent = `Syncing… ${elapsed}s`;
+      if (!status.inProgress) {
+        clearInterval(poll);
+        btn.disabled = false;
+        label.textContent = "Sync today's menu";
+        if (status.error) {
+          statusEl.textContent = `Sync failed: ${status.error}`;
+        } else {
+          state.menu = await api("/api/menu");
+          renderSyncStatus();
+          renderMenuPreview();
+        }
+      }
+    } catch (err) {
+      clearInterval(poll);
+      btn.disabled = false;
+      label.textContent = "Sync today's menu";
+      statusEl.textContent = `Lost track of sync progress: ${err.message}`;
+    }
+  }, 3000);
 });
 
 // ---------------- Add food dialog ----------------
@@ -398,6 +438,94 @@ document.getElementById("menuSearch").addEventListener("input", (e) => renderMen
 
 function allMenuItems() {
   return state.menu.stations.flatMap((s) => s.items.map((i) => ({ ...i, station: s.name })));
+}
+
+// Used when someone adds a food from the menu preview or "your favorites"
+// row, where there's no explicit meal card they clicked "+ Add food" on —
+// picks a reasonable default meal based on the time of day.
+function inferMealByTime() {
+  const h = new Date().getHours();
+  if (h < 11) return "breakfast";
+  if (h < 16) return "lunch";
+  if (h < 21) return "dinner";
+  return "snacks";
+}
+
+// "Today at Suwannee" — a lightweight preview of synced menu items with a
+// one-click path into the same add-food flow, so people don't have to open
+// the full dialog just to see what's available today.
+function renderMenuPreview() {
+  const card = document.getElementById("menuPreviewCard");
+  const list = document.getElementById("menuPreviewList");
+  const items = allMenuItems();
+
+  if (items.length === 0) {
+    card.classList.add("hidden");
+    return;
+  }
+  card.classList.remove("hidden");
+
+  const preview = items.slice(0, 6);
+  list.innerHTML =
+    preview
+      .map(
+        (item) => `
+        <div class="preview-item" data-preview-name="${escapeHtml(item.name)}">
+          <span class="preview-name">${escapeHtml(item.name)}</span>
+          <span class="preview-cal">${item.calories != null ? item.calories + " cal" : "—"}</span>
+        </div>`
+      )
+      .join("") + `<button class="preview-viewall" id="viewFullMenuBtn">View full menu →</button>`;
+
+  list.querySelectorAll(".preview-item").forEach((el) => {
+    el.addEventListener("click", () => {
+      const item = items.find((i) => i.name === el.dataset.previewName);
+      if (item) openQuickAddFromPreview(item);
+    });
+  });
+
+  document.getElementById("viewFullMenuBtn").addEventListener("click", () => openAddFood(inferMealByTime()));
+}
+
+function openQuickAddFromPreview(item) {
+  state.pendingMeal = inferMealByTime();
+  document.getElementById("dialogMealName").textContent = state.pendingMeal;
+  showDialogError("");
+  openServingPicker(item, "menu");
+  addFoodDialog.showModal();
+}
+
+// A small deterministic (no AI) nudge based on today's actual logged
+// nutrition vs goals, plus whatever's in the synced menu — not shown at all
+// if there's nothing meaningful to say yet (no meals logged, or no protein
+// goal set).
+function renderInsight() {
+  const card = document.getElementById("insightCard");
+  const textEl = document.getElementById("insightText");
+  const goal = state.settings;
+  const all = [...state.day.breakfast, ...state.day.lunch, ...state.day.dinner, ...state.day.snacks];
+
+  if (all.length === 0 || !(goal.proteinGoal > 0)) {
+    card.classList.add("hidden");
+    return;
+  }
+
+  const proteinConsumed = all.reduce((sum, e) => sum + (e.protein || 0) * e.servings, 0);
+  const remaining = goal.proteinGoal - proteinConsumed;
+  card.classList.remove("hidden");
+
+  if (remaining <= 0) {
+    textEl.textContent = "You've hit your protein goal for today — nice work.";
+    return;
+  }
+
+  const candidates = allMenuItems().filter((i) => i.protein != null && i.calories != null);
+  let suggestion = "";
+  if (candidates.length > 0) {
+    const best = candidates.reduce((a, b) => (b.protein > a.protein ? b : a));
+    suggestion = ` Suwannee has ${escapeHtml(best.name)} today with ${best.protein}g protein.`;
+  }
+  textEl.textContent = `You're ${Math.round(remaining)}g short of your protein goal.${suggestion}`;
 }
 
 function renderMenuResults(query) {
