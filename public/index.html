@@ -35,89 +35,103 @@
 
   <main class="stack">
 
-    <section class="nutrition-hero">
-      <p class="hero-eyebrow">Today's Nutrition</p>
-      <div class="hero-cals">
-        <span id="caloriesRemaining">0</span>
-        <span class="hero-goal" id="calorieGoalDisplay"></span>
-      </div>
-      <p class="hero-sub" id="ringLabel">logged today</p>
-
-      <div class="macro-grid">
-        <div class="macro-col">
-          <p class="macro-label">Protein</p>
-          <p class="macro-num" id="proteinValue">0g</p>
-          <div class="macro-track"><div class="macro-fill protein" id="proteinFill"></div></div>
+    <div class="col-main">
+      <section class="nutrition-hero">
+        <p class="hero-eyebrow">Today's Nutrition</p>
+        <div class="hero-cals">
+          <span id="caloriesRemaining">0</span>
+          <span class="hero-goal" id="calorieGoalDisplay"></span>
         </div>
-        <div class="macro-col">
-          <p class="macro-label">Carbs</p>
-          <p class="macro-num" id="carbsValue">0g</p>
-          <div class="macro-track"><div class="macro-fill carbs" id="carbsFill"></div></div>
+        <p class="hero-sub" id="ringLabel">logged today</p>
+
+        <div class="macro-grid">
+          <div class="macro-col">
+            <p class="macro-label">Protein</p>
+            <p class="macro-num" id="proteinValue">0g</p>
+            <div class="macro-track"><div class="macro-fill protein" id="proteinFill"></div></div>
+          </div>
+          <div class="macro-col">
+            <p class="macro-label">Carbs</p>
+            <p class="macro-num" id="carbsValue">0g</p>
+            <div class="macro-track"><div class="macro-fill carbs" id="carbsFill"></div></div>
+          </div>
+          <div class="macro-col">
+            <p class="macro-label">Fat</p>
+            <p class="macro-num" id="fatValue">0g</p>
+            <div class="macro-track"><div class="macro-fill fat" id="fatFill"></div></div>
+          </div>
         </div>
-        <div class="macro-col">
-          <p class="macro-label">Fat</p>
-          <p class="macro-num" id="fatValue">0g</p>
-          <div class="macro-track"><div class="macro-fill fat" id="fatFill"></div></div>
+      </section>
+
+      <section class="diary">
+        <h2 class="section-title">Today's Diary</h2>
+
+        <div class="meal-card" data-meal="breakfast">
+          <div class="meal-card-head">
+            <h3>Breakfast</h3>
+            <span class="meal-total" data-total="breakfast">0 cal</span>
+          </div>
+          <ul class="entry-list" data-list="breakfast"></ul>
+          <button class="add-food-btn" data-meal-add="breakfast">+ Add food</button>
         </div>
-      </div>
-    </section>
 
-    <section class="diary">
-      <h2 class="section-title">Today's Diary</h2>
-
-      <div class="meal-card" data-meal="breakfast">
-        <div class="meal-card-head">
-          <h3>Breakfast</h3>
-          <span class="meal-total" data-total="breakfast">0 cal</span>
+        <div class="meal-card" data-meal="lunch">
+          <div class="meal-card-head">
+            <h3>Lunch</h3>
+            <span class="meal-total" data-total="lunch">0 cal</span>
+          </div>
+          <ul class="entry-list" data-list="lunch"></ul>
+          <button class="add-food-btn" data-meal-add="lunch">+ Add food</button>
         </div>
-        <ul class="entry-list" data-list="breakfast"></ul>
-        <button class="add-food-btn" data-meal-add="breakfast">+ Add food</button>
-      </div>
 
-      <div class="meal-card" data-meal="lunch">
-        <div class="meal-card-head">
-          <h3>Lunch</h3>
-          <span class="meal-total" data-total="lunch">0 cal</span>
+        <div class="meal-card" data-meal="dinner">
+          <div class="meal-card-head">
+            <h3>Dinner</h3>
+            <span class="meal-total" data-total="dinner">0 cal</span>
+          </div>
+          <ul class="entry-list" data-list="dinner"></ul>
+          <button class="add-food-btn" data-meal-add="dinner">+ Add food</button>
         </div>
-        <ul class="entry-list" data-list="lunch"></ul>
-        <button class="add-food-btn" data-meal-add="lunch">+ Add food</button>
-      </div>
 
-      <div class="meal-card" data-meal="dinner">
-        <div class="meal-card-head">
-          <h3>Dinner</h3>
-          <span class="meal-total" data-total="dinner">0 cal</span>
+        <div class="meal-card" data-meal="snacks">
+          <div class="meal-card-head">
+            <h3>Snacks</h3>
+            <span class="meal-total" data-total="snacks">0 cal</span>
+          </div>
+          <ul class="entry-list" data-list="snacks"></ul>
+          <button class="add-food-btn" data-meal-add="snacks">+ Add food</button>
         </div>
-        <ul class="entry-list" data-list="dinner"></ul>
-        <button class="add-food-btn" data-meal-add="dinner">+ Add food</button>
-      </div>
+      </section>
+    </div>
 
-      <div class="meal-card" data-meal="snacks">
-        <div class="meal-card-head">
-          <h3>Snacks</h3>
-          <span class="meal-total" data-total="snacks">0 cal</span>
+    <div class="col-side">
+      <section class="sync-card">
+        <div class="sync-card-icon" aria-hidden="true">🍽</div>
+        <div class="sync-card-body">
+          <p class="sync-card-title">Suwannee Room</p>
+          <p class="sync-card-sub" id="syncStatus">Today's menu hasn't been synced yet</p>
         </div>
-        <ul class="entry-list" data-list="snacks"></ul>
-        <button class="add-food-btn" data-meal-add="snacks">+ Add food</button>
-      </div>
-    </section>
+        <button id="syncMenu" class="secondary-btn">
+          <span id="syncLabel">Sync today's menu</span>
+        </button>
+      </section>
 
-    <section class="sync-card">
-      <div class="sync-card-icon" aria-hidden="true">🍽</div>
-      <div class="sync-card-body">
-        <p class="sync-card-title">Suwannee Room</p>
-        <p class="sync-card-sub" id="syncStatus">Today's menu hasn't been synced yet</p>
-      </div>
-      <button id="syncMenu" class="secondary-btn">
-        <span id="syncLabel">Sync today's menu</span>
-      </button>
-    </section>
+      <section class="menu-preview-card hidden" id="menuPreviewCard">
+        <h2 class="section-title">Today at Suwannee</h2>
+        <div id="menuPreviewList"></div>
+      </section>
 
-    <section class="favorites-panel hidden" id="favoritesPanel">
-      <h2 class="section-title">Your Favorites</h2>
-      <p class="hint favorites-hint">Rated by you — expand any diary item to rate it</p>
-      <div class="favorites-list" id="favoritesList"></div>
-    </section>
+      <section class="insight-card hidden" id="insightCard">
+        <h2 class="section-title">Today's Insight</h2>
+        <p id="insightText"></p>
+      </section>
+
+      <section class="favorites-panel hidden" id="favoritesPanel">
+        <h2 class="section-title">Your Favorites</h2>
+        <p class="hint favorites-hint">Rated by you — expand any diary item to rate it</p>
+        <div class="favorites-list" id="favoritesList"></div>
+      </section>
+    </div>
 
   </main>
 </div>
