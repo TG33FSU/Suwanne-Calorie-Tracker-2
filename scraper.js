@@ -1,721 +1,550 @@
-// app.js — all client-side logic for the tracker. No build step, no framework:
-// plain fetch() calls to the Express API in server.js.
+// scraper.js
+//
+// Scrapes today's menu + nutrition facts from the Suwannee Room page on
+// Seminole Dining's site (a JS-rendered site, so we drive a real headless
+// browser rather than fetching raw HTML).
+//
+// IMPORTANT / READ ME:
+// I built this against the page's public structure, but I could not run a
+// live browser against seminoledining.mydininghub.com from my own sandbox to
+// verify exact CSS class names (my dev environment's network is locked down
+// to package registries only). So this scraper is written defensively: it
+// tries several common selector patterns and falls back gracefully, and it
+// dumps debug info to help you fix things quickly if the site's markup
+// doesn't match what it expects.
+//
+// HOW TO FIX IT IF SCRAPING RETURNS 0 ITEMS OR BAD NUTRITION DATA:
+//   1. Run:  node scraper.js --debug
+//      This opens a *visible* (non-headless) browser window and prints
+//      candidate selectors + counts to the console, and saves
+//      data/debug-page.html (the fully rendered HTML) for inspection.
+//   2. Open data/debug-page.html in a normal browser, or use Chrome DevTools
+//      on the live site (right-click a menu item -> Inspect) to find the
+//      real class names / structure.
+//   3. Update the SELECTORS object below to match what you find.
+//
+// The rest of the app (manual "Add Custom Food") works completely
+// independently of this scraper, so you can always log meals by hand even
+// if the site changes and this needs a tune-up.
 
-const state = {
-  date: todayStr(),
-  settings: { calorieGoal: 2200, proteinGoal: 130, carbGoal: 250, fatGoal: 70 },
-  day: { breakfast: [], lunch: [], dinner: [], snacks: [] },
-  menu: { stations: [] },
-  customFoods: [],
-  ratings: {},
-  pendingMeal: null, // which meal the "add food" dialog is currently targeting
-  pendingFood: null, // the food selected in the serving-picker step
+const fs = require("fs");
+let puppeteer;
+try {
+  puppeteer = require("puppeteer");
+} catch {
+  puppeteer = require("puppeteer-core");
+}
+
+function findLocalChrome() {
+  const candidates = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+  ];
+  return candidates.find((p) => fs.existsSync(p));
+}
+const path = require("path");
+
+const MENU_URL = "https://seminoledining.mydininghub.com/en/location/suwannee-room";
+
+// ---------------------------------------------------------------------------
+// SELECTORS: the most likely thing you'll need to edit if the site changes
+// its markup. Each is a list of candidates tried in order; first match wins.
+// ---------------------------------------------------------------------------
+const SELECTORS = {
+  // A station/category heading (e.g. "Grill", "Pizza", "Global Solutions")
+  stationHeading: ['h2', 'h3', '[class*="station"]', '[class*="category"]'],
+
+  // A clickable menu item card/row/button
+  menuItem: [
+    '[class*="menu-item"]',
+    '[class*="MenuItem"]',
+    '[data-testid*="menu-item"]',
+    'button[class*="item"]',
+    'li[class*="item"]',
+    '[class*="product-card"]',
+    '[class*="dish"]',
+  ],
+
+  // The nutrition modal/panel that opens after clicking an item
+  nutritionModal: [
+    '[role="dialog"]',
+    '[class*="modal"]',
+    '[class*="Modal"]',
+    '[class*="nutrition"]',
+    '[class*="Nutrition"]',
+    '[class*="drawer"]',
+  ],
+
+  // A close button for the modal, so we can move to the next item
+  modalClose: [
+    '[aria-label="Close"]',
+    'button[class*="close"]',
+    '[class*="Close"]',
+  ],
 };
 
-function todayStr() {
-  const d = new Date();
-  const tz = d.getTimezoneOffset() * 60000;
-  return new Date(d - tz).toISOString().slice(0, 10);
+// Regex patterns used to pull numbers out of the "Summary Nutritional
+// Information" text block, matched against the exact field labels confirmed
+// on the live Suwannee Room "Meal Calculator" panel.
+const NUTRIENT_PATTERNS = {
+  calories: /calories?\s*[:\-]?\s*(\d+(?:\.\d+)?)/i,
+  protein: /protein\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*g/i,
+  totalCarbs: /total carbohydrate[s]?\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*g/i,
+  totalFat: /total fat\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*g/i,
+  saturatedFat: /saturated fat\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*g/i,
+  transFat: /trans fat\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*g/i,
+  cholesterol: /cholesterol\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*mg/i,
+  sugars: /(?:total sugars|sugars)\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*g/i,
+  addedSugars: /added sugars\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*g/i,
+  fiber: /(?:dietary fiber|fiber)\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*g/i,
+  sodium: /sodium\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*mg/i,
+  servingSize: /serving size\s*[:\-]?\s*([^\n]+)/i,
+};
+
+// The item selector is intentionally broad (any button with "item" in its
+// class name), which can also catch site-chrome buttons like "Sign Out" or
+// "Retry" that happen to share that class naming convention. Filter those
+// out by name before we waste time trying to click into them.
+const EXCLUDE_NAME_PATTERNS = [
+  /^sign in$/i,
+  /^sign out$/i,
+  /^log in$/i,
+  /^log out$/i,
+  /^retry$/i,
+  /^loading/i,
+  /^add to cart$/i,
+  /^view cart$/i,
+  /^checkout$/i,
+  /^search$/i,
+  /^filters?$/i,
+  /^clear( all)?$/i,
+  /^apply$/i,
+  /^close$/i,
+  /^submit$/i,
+  /^continue$/i,
+  /^next$/i,
+  /^previous$/i,
+  /^back$/i,
+  /^home$/i,
+  /^locations?$/i,
+  /^favorites?$/i,
+  /^menu$/i,
+  /^cart$/i,
+  /^my account$/i,
+  /^\s*$/,
+  // Patterns confirmed from real Suwannee Room page output:
+  /^add$/i, // the "Add to cart" button rendered next to each item's name
+  /^view menu$/i,
+  /^add to favorites$/i,
+  /^meal:/i, // e.g. "Meal:Dinner" (meal-period toggle)
+  /^view:/i, // e.g. "View:Daily" (view toggle)
+  /^\d+\s*items?\d*\s*cal/i, // e.g. "0 items0 Cal" (cart summary pill)
+  /^print$/i,
+  /^my menu preferences$/i,
+  /^view more$/i,
+  /^join$/i, // "Join our email list" style footer/promo button
+];
+
+function isLikelyFoodItem(name) {
+  if (!name || name.length < 2 || name.length > 120) return false;
+  return !EXCLUDE_NAME_PATTERNS.some((re) => re.test(name.trim()));
 }
 
-// ---------------- API helpers ----------------
-
-async function api(path, opts) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || `Request failed: ${res.status}`);
+function parseNutritionText(text) {
+  const result = {};
+  for (const [key, regex] of Object.entries(NUTRIENT_PATTERNS)) {
+    const match = text.match(regex);
+    result[key] = match ? (key === "servingSize" ? match[1].trim() : Number(match[1])) : null;
   }
-  return res.json();
+  return result;
 }
 
-function renderFavorites() {
-  const panel = document.getElementById("favoritesPanel");
-  const list = document.getElementById("favoritesList");
-  const ranked = Object.values(state.ratings)
-    .filter((r) => r.ratingCount > 0)
-    .sort((a, b) => b.avgStars - a.avgStars || b.ratingCount - a.ratingCount)
-    .slice(0, 6);
-
-  if (ranked.length === 0) {
-    panel.classList.add("hidden");
-    return;
+async function findFirstMatch(page, selectorList) {
+  for (const sel of selectorList) {
+    const count = await page.$$eval(sel, (els) => els.length).catch(() => 0);
+    if (count > 0) return { selector: sel, count };
   }
-  panel.classList.remove("hidden");
-
-  const medals = ["🥇", "🥈", "🥉"];
-  list.innerHTML = ranked
-    .map((r, i) => {
-      const n = r.lastNutrition || {};
-      const stars = "★".repeat(Math.round(r.avgStars)) + "☆".repeat(5 - Math.round(r.avgStars));
-      const tagBits = [];
-      if (r.tags?.wouldEatAgain) tagBits.push(`🔥 ${r.tags.wouldEatAgain}`);
-      if (r.tags?.greatProtein) tagBits.push(`💪 ${r.tags.greatProtein}`);
-      if (r.tags?.worthGetting) tagBits.push(`💰 ${r.tags.worthGetting}`);
-      if (r.tags?.skipIt) tagBits.push(`👎 ${r.tags.skipIt}`);
-      return `
-        <div class="favorite-card">
-          <div class="fav-rank">${medals[i] || "⭐"}</div>
-          <p class="fav-name">${escapeHtml(r.name)}</p>
-          <div><span class="fav-stars">${stars}</span><span class="fav-count">${r.ratingCount} rating${r.ratingCount === 1 ? "" : "s"}</span></div>
-          <div class="fav-macros">${n.calories ?? "?"} cal · ${n.protein ?? "?"}g protein${tagBits.length ? " · " + tagBits.join(" ") : ""}</div>
-          <div class="fav-add-row">
-            <select class="fav-meal-select" data-fav="${escapeHtml(r.name)}">
-              <option value="breakfast">Breakfast</option>
-              <option value="lunch">Lunch</option>
-              <option value="dinner">Dinner</option>
-              <option value="snacks" selected>Snacks</option>
-            </select>
-            <button class="fav-add-btn" data-fav-add="${escapeHtml(r.name)}">Add</button>
-          </div>
-        </div>`;
-    })
-    .join("");
-
-  list.querySelectorAll(".fav-add-btn").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const name = btn.dataset.favAdd;
-      const rating = ranked.find((r) => r.name === name);
-      const select = list.querySelector(`.fav-meal-select[data-fav="${CSS.escape(name)}"]`);
-      const meal = select.value;
-      const n = rating.lastNutrition || {};
-      await api(`/api/diary/${state.date}/${meal}`, {
-        method: "POST",
-        body: JSON.stringify({ ...n, name, servings: 1, source: "favorite" }),
-      });
-      state.day = await api(`/api/diary/${state.date}`);
-      renderDiary();
-      renderSummary();
-      btn.textContent = "Added!";
-      setTimeout(() => (btn.textContent = "Add"), 1200);
-    });
-  });
+  return null;
 }
 
-// ---------------- Load & render ----------------
-
-async function loadAll() {
-  const [day, settings, menu, customFoods, ratings] = await Promise.all([
-    api(`/api/diary/${state.date}`),
-    api("/api/settings"),
-    api("/api/menu"),
-    api("/api/custom-foods"),
-    api("/api/ratings"),
-  ]);
-  state.day = day;
-  state.settings = settings;
-  state.menu = menu;
-  state.customFoods = customFoods;
-  state.ratings = ratings;
-  render();
-}
-
-function render() {
-  document.getElementById("datePicker").value = state.date;
-  renderDiary();
-  renderSummary();
-  renderSyncStatus();
-  renderFavorites();
-  renderMenuPreview();
-  renderInsight();
-}
-
-function renderDiary() {
-  ["breakfast", "lunch", "dinner", "snacks"].forEach((meal) => {
-    const list = document.querySelector(`[data-list="${meal}"]`);
-    const entries = state.day[meal] || [];
-    list.innerHTML = "";
-
-    if (entries.length === 0) {
-      const li = document.createElement("li");
-      li.className = "empty-meal";
-      li.textContent = "No food logged yet.";
-      list.appendChild(li);
-    } else {
-      entries.forEach((e) => list.appendChild(renderEntry(meal, e)));
+// Clicks the first button/link/role=button element whose visible text
+// matches exactly (case-insensitive). Used for "Clear all" in the Meal
+// Calculator panel, which we don't have (and don't need) a stable CSS
+// selector for.
+async function clickButtonByText(page, text) {
+  return page.evaluate((targetText) => {
+    const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+    const match = candidates.find(
+      (el) => el.textContent && el.textContent.trim().toLowerCase() === targetText.toLowerCase()
+    );
+    if (match) {
+      match.click();
+      return true;
     }
-
-    const total = entries.reduce((sum, e) => sum + e.calories * e.servings, 0);
-    document.querySelector(`[data-total="${meal}"]`).textContent = `${Math.round(total)} cal`;
-  });
+    return false;
+  }, text);
 }
 
-function renderEntry(meal, entry) {
-  const li = document.createElement("li");
-  li.className = "entry-item";
-  const cals = Math.round(entry.calories * entry.servings);
-  const s = entry.servings;
-  li.innerHTML = `
-    <div class="entry-row">
-      <button class="entry-expand" title="Nutrition facts">▸</button>
-      <span class="entry-name">${escapeHtml(entry.name)}</span>
-      <span class="entry-meta">${entry.servings}× ${escapeHtml(entry.servingSize || "")}</span>
-      <span class="entry-cal">${cals} cal</span>
-      <button class="remove-entry" title="Remove">&times;</button>
-    </div>
-    <div class="nutrition-facts hidden">
-      ${nutritionFactsRows(entry, s)}
-      ${ratingWidgetHtml(entry)}
-    </div>
-  `;
+// Clicking an item's "Add" button only adds it to the calculator silently —
+// it does NOT open the nutrition popup by itself. To actually see nutrition,
+// you have to separately click the small "N items / N Cal" summary pill
+// elsewhere on the page, which opens the "Meal Calculator" modal. This finds
+// and clicks that pill.
+async function clickCalculatorPill(page) {
+  return page.evaluate(() => {
+    const regex = /^\d+\s*items?\s*\d*\s*cal/i;
+    const all = Array.from(document.querySelectorAll("body *"));
+    // Prefer the most specific (leaf-most) element whose own text matches,
+    // to avoid grabbing some huge wrapping container.
+    const leafMatches = all.filter(
+      (el) => el.children.length === 0 && el.textContent && regex.test(el.textContent.trim())
+    );
+    const candidate =
+      leafMatches[0] || all.find((el) => el.textContent && regex.test(el.textContent.trim()));
+    if (!candidate) return false;
 
-  li.querySelector(".entry-expand").addEventListener("click", (e) => {
-    const panel = li.querySelector(".nutrition-facts");
-    const collapsed = panel.classList.toggle("hidden");
-    e.target.textContent = collapsed ? "▸" : "▾";
-  });
-
-  li.querySelector(".remove-entry").addEventListener("click", async () => {
-    await api(`/api/diary/${state.date}/${meal}/${entry.id}`, { method: "DELETE" });
-    state.day[meal] = state.day[meal].filter((e) => e.id !== entry.id);
-    renderDiary();
-    renderSummary();
-  });
-
-  wireRatingWidget(li, entry);
-  return li;
-}
-
-function ratingWidgetHtml(entry) {
-  return `
-    <div class="rate-widget">
-      <p class="rate-label">How was it?</p>
-      <div class="star-picker" data-stars="0">
-        ${[1, 2, 3, 4, 5].map((n) => `<button type="button" class="star-btn" data-star="${n}">★</button>`).join("")}
-      </div>
-      <div class="tag-chips">
-        <button type="button" class="tag-chip" data-tag="wouldEatAgain">🔥 Would eat again</button>
-        <button type="button" class="tag-chip" data-tag="greatProtein">💪 Great for protein</button>
-        <button type="button" class="tag-chip" data-tag="worthGetting">💰 Worth getting</button>
-        <button type="button" class="tag-chip" data-tag="skipIt">👎 Skip it</button>
-      </div>
-      <button type="button" class="save-rating-btn">Save rating</button>
-    </div>
-  `;
-}
-
-function wireRatingWidget(li, entry) {
-  const picker = li.querySelector(".star-picker");
-  const stars = Array.from(li.querySelectorAll(".star-btn"));
-  const tagChips = Array.from(li.querySelectorAll(".tag-chip"));
-  const saveBtn = li.querySelector(".save-rating-btn");
-
-  stars.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const val = Number(btn.dataset.star);
-      picker.dataset.stars = val;
-      stars.forEach((s) => s.classList.toggle("filled", Number(s.dataset.star) <= val));
-    });
-  });
-
-  tagChips.forEach((chip) => {
-    chip.addEventListener("click", () => chip.classList.toggle("active"));
-  });
-
-  saveBtn.addEventListener("click", async () => {
-    const starsVal = Number(picker.dataset.stars);
-    if (!starsVal) {
-      saveBtn.textContent = "Pick stars first";
-      setTimeout(() => (saveBtn.textContent = "Save rating"), 1500);
-      return;
-    }
-    const tags = {};
-    tagChips.forEach((chip) => {
-      if (chip.classList.contains("active")) tags[chip.dataset.tag] = true;
-    });
-
-    await api("/api/ratings", {
-      method: "POST",
-      body: JSON.stringify({
-        name: entry.name,
-        stars: starsVal,
-        tags,
-        calories: entry.calories,
-        protein: entry.protein,
-        totalCarbs: entry.totalCarbs,
-        totalFat: entry.totalFat,
-        servingSize: entry.servingSize,
-      }),
-    });
-
-    state.ratings = await api("/api/ratings");
-    renderFavorites();
-    saveBtn.textContent = "Saved!";
-    setTimeout(() => (saveBtn.textContent = "Save rating"), 1500);
-  });
-}
-
-function nutritionFactsRows(entry, s) {
-  const row = (label, value, unit, indent) => `
-    <div class="fact-row ${indent ? "fact-indent" : ""}">
-      <span>${label}</span><span>${Math.round((value || 0) * s * 10) / 10}${unit}</span>
-    </div>`;
-  return [
-    row("Total Fat", entry.totalFat, "g", false),
-    row("Saturated Fat", entry.saturatedFat, "g", true),
-    row("Trans Fat", entry.transFat, "g", true),
-    row("Cholesterol", entry.cholesterol, "mg", false),
-    row("Sodium", entry.sodium, "mg", false),
-    row("Total Carbohydrates", entry.totalCarbs, "g", false),
-    row("Dietary Fiber", entry.fiber, "g", true),
-    row("Total Sugars", entry.sugars, "g", true),
-    row("Added Sugars", entry.addedSugars, "g", true),
-    row("Protein", entry.protein, "g", false),
-  ].join("");
-}
-
-function renderSummary() {
-  const all = [...state.day.breakfast, ...state.day.lunch, ...state.day.dinner, ...state.day.snacks];
-  const totals = all.reduce(
-    (acc, e) => {
-      acc.calories += e.calories * e.servings;
-      acc.protein += e.protein * e.servings;
-      acc.carbs += e.totalCarbs * e.servings;
-      acc.fat += e.totalFat * e.servings;
-      return acc;
-    },
-    { calories: 0, protein: 0, carbs: 0, fat: 0 }
-  );
-
-  const goal = state.settings;
-  const valueEl = document.getElementById("caloriesRemaining");
-  const goalEl = document.getElementById("calorieGoalDisplay");
-  const labelEl = document.getElementById("ringLabel");
-
-  if (goal.calorieGoal > 0) {
-    valueEl.textContent = Math.round(totals.calories).toLocaleString();
-    goalEl.textContent = `/ ${Math.round(goal.calorieGoal).toLocaleString()}`;
-    labelEl.textContent =
-      totals.calories > goal.calorieGoal
-        ? `${Math.round(totals.calories - goal.calorieGoal).toLocaleString()} over goal`
-        : `${Math.round(goal.calorieGoal - totals.calories).toLocaleString()} calories left today`;
-  } else {
-    // No goal set yet — show what's been logged, no fake target.
-    valueEl.textContent = Math.round(totals.calories).toLocaleString();
-    goalEl.textContent = "";
-    labelEl.textContent = "logged today — set a goal via ⚙";
-  }
-
-  setMacro("protein", totals.protein, goal.proteinGoal);
-  setMacro("carbs", totals.carbs, goal.carbGoal);
-  setMacro("fat", totals.fat, goal.fatGoal);
-}
-
-function setMacro(key, value, goal) {
-  const pct = goal > 0 ? Math.min(100, (value / goal) * 100) : 0;
-  document.getElementById(`${key}Fill`).style.width = `${pct}%`;
-  const valueText = goal > 0 ? `${Math.round(value)} / ${Math.round(goal)}g` : `${Math.round(value)}g`;
-  document.getElementById(`${key}Value`).textContent = valueText;
-}
-
-function renderSyncStatus() {
-  const el = document.getElementById("syncStatus");
-  if (!state.menu.scrapedAt) {
-    el.textContent = "Today's menu hasn't been synced yet";
-    return;
-  }
-  const itemCount = state.menu.stations.reduce((n, s) => n + s.items.length, 0);
-  const when = new Date(state.menu.scrapedAt).toLocaleString([], { hour: "numeric", minute: "2-digit" });
-  el.textContent = `✓ Menu synced at ${when} · ${itemCount} foods available` + (state.menu.warning ? ` · ${state.menu.warning}` : "");
-}
-
-function escapeHtml(str) {
-  return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
-// ---------------- Date navigation ----------------
-
-document.getElementById("datePicker").addEventListener("change", (e) => {
-  state.date = e.target.value;
-  loadAll();
-});
-document.getElementById("prevDay").addEventListener("click", () => shiftDate(-1));
-document.getElementById("nextDay").addEventListener("click", () => shiftDate(1));
-document.getElementById("todayBtn").addEventListener("click", () => {
-  state.date = todayStr();
-  loadAll();
-});
-function shiftDate(delta) {
-  const d = new Date(state.date + "T00:00:00");
-  d.setDate(d.getDate() + delta);
-  state.date = d.toISOString().slice(0, 10);
-  loadAll();
-}
-
-// ---------------- Sync menu ----------------
-
-document.getElementById("syncMenu").addEventListener("click", async () => {
-  const btn = document.getElementById("syncMenu");
-  const label = document.getElementById("syncLabel");
-  const statusEl = document.getElementById("syncStatus");
-  btn.disabled = true;
-
-  try {
-    // Kick the scrape off — this returns almost instantly now; the actual
-    // scraping happens in the background on the server so we don't hold
-    // open one long request (which is what was causing the 502 — Render's
-    // proxy kills requests that stay open for minutes, even though the
-    // scrape itself was still working fine).
-    const started = await api("/api/menu/refresh", { method: "POST" });
-    if (started.error && !started.status) {
-      throw new Error(started.error);
-    }
-  } catch (err) {
-    // A 409 here just means one's already running — that's fine, fall
-    // through to polling instead of treating it as a failure.
-    if (!/already in progress/i.test(err.message)) {
-      statusEl.textContent = `Sync failed: ${err.message}`;
-      btn.disabled = false;
-      return;
-    }
-  }
-
-  let elapsed = 0;
-  label.textContent = "Syncing…";
-  const poll = setInterval(async () => {
-    elapsed += 3;
-    try {
-      const status = await api("/api/menu/refresh/status");
-      label.textContent = `Syncing… ${elapsed}s`;
-      if (!status.inProgress) {
-        clearInterval(poll);
-        btn.disabled = false;
-        label.textContent = "Sync today's menu";
-        if (status.error) {
-          statusEl.textContent = `Sync failed: ${status.error}`;
-        } else {
-          state.menu = await api("/api/menu");
-          renderSyncStatus();
-          renderMenuPreview();
-        }
+    // Walk up a few levels to find an actually-clickable ancestor, since the
+    // matching text node is often inside a plain <span> or <div>.
+    let target = candidate;
+    let el = candidate;
+    for (let i = 0; i < 4 && el; i++) {
+      if (el.tagName === "BUTTON" || el.tagName === "A" || el.getAttribute("role") === "button") {
+        target = el;
+        break;
       }
-    } catch (err) {
-      clearInterval(poll);
-      btn.disabled = false;
-      label.textContent = "Sync today's menu";
-      statusEl.textContent = `Lost track of sync progress: ${err.message}`;
+      el = el.parentElement;
     }
-  }, 3000);
-});
-
-// ---------------- Add food dialog ----------------
-
-const addFoodDialog = document.getElementById("addFoodDialog");
-
-document.querySelectorAll("[data-meal-add]").forEach((btn) => {
-  btn.addEventListener("click", () => openAddFood(btn.dataset.mealAdd));
-});
-
-function openAddFood(meal) {
-  state.pendingMeal = meal;
-  document.getElementById("dialogMealName").textContent = meal;
-  document.getElementById("manualHint").textContent = "";
-  document.getElementById("manualForm").reset();
-  showDialogError("");
-  switchTab("menu");
-  renderMenuResults("");
-  renderCustomResults();
-  addFoodDialog.showModal();
-}
-
-document.getElementById("closeDialog").addEventListener("click", () => addFoodDialog.close());
-
-document.querySelectorAll(".tab-btn").forEach((btn) => {
-  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
-});
-
-function switchTab(tab) {
-  document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
-  document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("hidden", p.dataset.panel !== tab));
-}
-
-// --- Menu search tab ---
-
-document.getElementById("menuSearch").addEventListener("input", (e) => renderMenuResults(e.target.value));
-
-function allMenuItems() {
-  return state.menu.stations.flatMap((s) => s.items.map((i) => ({ ...i, station: s.name })));
-}
-
-// Used when someone adds a food from the menu preview or "your favorites"
-// row, where there's no explicit meal card they clicked "+ Add food" on —
-// picks a reasonable default meal based on the time of day.
-function inferMealByTime() {
-  const h = new Date().getHours();
-  if (h < 11) return "breakfast";
-  if (h < 16) return "lunch";
-  if (h < 21) return "dinner";
-  return "snacks";
-}
-
-// "Today at Suwannee" — a lightweight preview of synced menu items with a
-// one-click path into the same add-food flow, so people don't have to open
-// the full dialog just to see what's available today.
-function renderMenuPreview() {
-  const card = document.getElementById("menuPreviewCard");
-  const list = document.getElementById("menuPreviewList");
-  const items = allMenuItems();
-
-  if (items.length === 0) {
-    card.classList.add("hidden");
-    return;
-  }
-  card.classList.remove("hidden");
-
-  const preview = items.slice(0, 6);
-  list.innerHTML =
-    preview
-      .map(
-        (item) => `
-        <div class="preview-item" data-preview-name="${escapeHtml(item.name)}">
-          <span class="preview-name">${escapeHtml(item.name)}</span>
-          <span class="preview-cal">${item.calories != null ? item.calories + " cal" : "—"}</span>
-        </div>`
-      )
-      .join("") + `<button class="preview-viewall" id="viewFullMenuBtn">View full menu →</button>`;
-
-  list.querySelectorAll(".preview-item").forEach((el) => {
-    el.addEventListener("click", () => {
-      const item = items.find((i) => i.name === el.dataset.previewName);
-      if (item) openQuickAddFromPreview(item);
-    });
-  });
-
-  document.getElementById("viewFullMenuBtn").addEventListener("click", () => openAddFood(inferMealByTime()));
-}
-
-function openQuickAddFromPreview(item) {
-  state.pendingMeal = inferMealByTime();
-  document.getElementById("dialogMealName").textContent = state.pendingMeal;
-  showDialogError("");
-  openServingPicker(item, "menu");
-  addFoodDialog.showModal();
-}
-
-// A small deterministic (no AI) nudge based on today's actual logged
-// nutrition vs goals, plus whatever's in the synced menu — not shown at all
-// if there's nothing meaningful to say yet (no meals logged, or no protein
-// goal set).
-function renderInsight() {
-  const card = document.getElementById("insightCard");
-  const textEl = document.getElementById("insightText");
-  const goal = state.settings;
-  const all = [...state.day.breakfast, ...state.day.lunch, ...state.day.dinner, ...state.day.snacks];
-
-  if (all.length === 0 || !(goal.proteinGoal > 0)) {
-    card.classList.add("hidden");
-    return;
-  }
-
-  const proteinConsumed = all.reduce((sum, e) => sum + (e.protein || 0) * e.servings, 0);
-  const remaining = goal.proteinGoal - proteinConsumed;
-  card.classList.remove("hidden");
-
-  if (remaining <= 0) {
-    textEl.textContent = "You've hit your protein goal for today — nice work.";
-    return;
-  }
-
-  const candidates = allMenuItems().filter((i) => i.protein != null && i.calories != null);
-  let suggestion = "";
-  if (candidates.length > 0) {
-    const best = candidates.reduce((a, b) => (b.protein > a.protein ? b : a));
-    suggestion = ` Suwannee has ${escapeHtml(best.name)} today with ${best.protein}g protein.`;
-  }
-  textEl.textContent = `You're ${Math.round(remaining)}g short of your protein goal.${suggestion}`;
-}
-
-function renderMenuResults(query) {
-  const list = document.getElementById("menuResults");
-  list.innerHTML = "";
-  const q = query.trim().toLowerCase();
-  const items = allMenuItems().filter((i) => !q || i.name.toLowerCase().includes(q));
-
-  if (items.length === 0) {
-    const li = document.createElement("li");
-    li.className = "hint";
-    li.style.cursor = "default";
-    li.textContent = state.menu.stations.length === 0
-      ? "No menu synced yet. Click \"Sync Suwannee Room menu\" or use Quick add."
-      : "No matches. Try Quick add to log it manually.";
-    list.appendChild(li);
-    return;
-  }
-
-  items.slice(0, 60).forEach((item) => {
-    const li = document.createElement("li");
-    const cal = item.calories != null ? `${item.calories} cal` : "cal unknown";
-    li.innerHTML = `<span class="fname">${escapeHtml(item.name)}</span><span class="fmeta">${cal} · ${escapeHtml(item.station)}</span>`;
-    li.addEventListener("click", () => openServingPicker(item, "menu"));
-    list.appendChild(li);
-  });
-}
-
-// --- My foods tab ---
-
-function renderCustomResults() {
-  const list = document.getElementById("customResults");
-  list.innerHTML = "";
-  if (state.customFoods.length === 0) {
-    const li = document.createElement("li");
-    li.className = "hint";
-    li.style.cursor = "default";
-    li.textContent = "Nothing saved yet. Foods you quick-add will show up here.";
-    list.appendChild(li);
-    return;
-  }
-  state.customFoods.forEach((item) => {
-    const li = document.createElement("li");
-    li.innerHTML = `<span class="fname">${escapeHtml(item.name)}</span><span class="fmeta">${item.calories} cal</span>`;
-    li.addEventListener("click", () => openServingPicker(item, "custom"));
-    list.appendChild(li);
-  });
-}
-
-// --- Quick add (manual) tab ---
-
-document.getElementById("manualForm").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  showDialogError("");
-  const fd = new FormData(e.target);
-  const food = {
-    name: fd.get("name"),
-    calories: Number(fd.get("calories")) || 0,
-    protein: Number(fd.get("protein")) || 0,
-    totalCarbs: Number(fd.get("totalCarbs")) || 0,
-    totalFat: Number(fd.get("totalFat")) || 0,
-    servingSize: fd.get("servingSize") || "1 serving",
-  };
-
-  try {
-    if (fd.get("save")) {
-      const saved = await api("/api/custom-foods", { method: "POST", body: JSON.stringify(food) });
-      state.customFoods.push(saved);
-    }
-  } catch (err) {
-    showDialogError(`Couldn't save to My foods (adding to diary anyway): ${err.message}`);
-  }
-
-  const ok = await logEntry({ ...food, servings: 1, source: "manual" });
-  if (ok) {
-    e.target.reset();
-    document.getElementById("manualHint").textContent = "";
-    addFoodDialog.close();
-  }
-});
-
-// --- Serving picker step ---
-
-function openServingPicker(item, source) {
-  // If we couldn't parse nutrition data for this item (the sync's nutrition
-  // panel step failed for it), don't let the user add a fake "0 calorie"
-  // entry — send them to Quick add instead, pre-filled with the name, so
-  // they can type in the real numbers (e.g. from the label at the station).
-  if (item.calories == null) {
-    switchTab("manual");
-    const form = document.getElementById("manualForm");
-    form.name.value = item.name;
-    form.servingSize.value = item.servingSize || "";
-    document.getElementById("manualHint").textContent =
-      `We synced "${item.name}" but couldn't read its nutrition facts. Enter them here (check the label at the station, or the item on the dining site).`;
-    return;
-  }
-
-  state.pendingFood = { ...item, source };
-  document.getElementById("servingFoodName").textContent = item.name;
-  document.getElementById("servingBase").textContent =
-    `${item.calories ?? "?"} cal per ${item.servingSize || "serving"}` + (item.station ? ` · ${item.station}` : "");
-  document.getElementById("servingCount").value = 1;
-  updateServingPreview();
-  switchTab("serving");
-}
-
-document.getElementById("servingCount").addEventListener("input", updateServingPreview);
-
-function updateServingPreview() {
-  const servings = Number(document.getElementById("servingCount").value) || 0;
-  const food = state.pendingFood;
-  const preview = document.getElementById("servingPreview");
-  if (!food) return;
-  const n = (v) => Math.round((v || 0) * servings * 10) / 10;
-  preview.innerHTML = `
-    <div class="preview-headline"><span>${n(food.calories)} cal</span><span>${n(food.protein)}g protein</span><span>${n(food.totalCarbs)}g carbs</span><span>${n(food.totalFat)}g fat</span></div>
-    <div class="preview-detail">
-      <span>Sat fat ${n(food.saturatedFat)}g</span>
-      <span>Trans fat ${n(food.transFat)}g</span>
-      <span>Cholesterol ${n(food.cholesterol)}mg</span>
-      <span>Sodium ${n(food.sodium)}mg</span>
-      <span>Fiber ${n(food.fiber)}g</span>
-      <span>Sugars ${n(food.sugars)}g</span>
-      <span>Added sugars ${n(food.addedSugars)}g</span>
-    </div>
-  `;
-}
-
-document.getElementById("confirmAdd").addEventListener("click", async () => {
-  const servings = Number(document.getElementById("servingCount").value) || 1;
-  const food = state.pendingFood;
-  const ok = await logEntry({ ...food, servings, source: food.source });
-  if (ok) addFoodDialog.close();
-});
-
-function showDialogError(message) {
-  const el = document.getElementById("dialogError");
-  el.textContent = message;
-  el.classList.toggle("hidden", !message);
-}
-
-async function logEntry(food) {
-  showDialogError("");
-  try {
-    const entry = await api(`/api/diary/${state.date}/${state.pendingMeal}`, {
-      method: "POST",
-      body: JSON.stringify(food),
-    });
-    state.day[state.pendingMeal].push(entry);
-    renderDiary();
-    renderSummary();
+    target.click();
     return true;
-  } catch (err) {
-    showDialogError(`Couldn't add that food: ${err.message}`);
+  });
+}
+
+// After reading nutrition, close whatever dialog/modal is open so the next
+// item starts from a clean state.
+async function closeAnyDialog(page) {
+  const closed = await page.evaluate(() => {
+    const selectors = ['[aria-label="Close"]', '[aria-label="close"]', 'button[class*="close" i]'];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        el.click();
+        return true;
+      }
+    }
+    return false;
+  });
+  if (!closed) {
+    await page.keyboard.press("Escape").catch(() => {});
+  }
+}
+
+const MEAL_PERIODS = ["Breakfast", "Lunch", "Dinner"];
+
+function emptyNutrition() {
+  return {
+    calories: null,
+    protein: null,
+    totalCarbs: null,
+    totalFat: null,
+    saturatedFat: null,
+    transFat: null,
+    cholesterol: null,
+    sugars: null,
+    addedSugars: null,
+    fiber: null,
+    sodium: null,
+    servingSize: null,
+  };
+}
+
+// Switches the page's active meal period via the "Meal:X" toggle seen on the
+// live site, so a single sync can capture Breakfast + Lunch + Dinner instead
+// of whatever period happens to be showing at scrape time. This is another
+// UI-structure guess (like the Add-button logic above) — if it can't find
+// the toggle or the period option, it logs a warning in --debug mode rather
+// than failing the whole sync; whatever period is currently showing just
+// gets scraped and tagged with the period name that was intended.
+async function switchMealPeriod(page, period, debug) {
+  const opened = await page.evaluate(() => {
+    const all = Array.from(document.querySelectorAll("body *"));
+    const toggle = all.find(
+      (el) => el.children.length === 0 && el.textContent && /^meal\s*:/i.test(el.textContent.trim())
+    );
+    if (!toggle) return false;
+    let el = toggle;
+    let target = toggle;
+    for (let i = 0; i < 4 && el; i++) {
+      if (el.tagName === "BUTTON" || el.tagName === "A" || el.getAttribute("role") === "button") {
+        target = el;
+        break;
+      }
+      el = el.parentElement;
+    }
+    target.click();
+    return true;
+  });
+
+  if (!opened) {
+    if (debug) console.warn(`  [debug] Couldn't find the "Meal:" toggle to switch to ${period}.`);
     return false;
   }
+
+  await new Promise((r) => setTimeout(r, 350));
+
+  const selected = await page.evaluate((targetPeriod) => {
+    const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], li, div, span'));
+    const match = candidates.find(
+      (el) =>
+        el.children.length === 0 &&
+        el.textContent &&
+        el.textContent.trim().toLowerCase() === targetPeriod.toLowerCase()
+    );
+    if (!match) return false;
+    let el = match;
+    let target = match;
+    for (let i = 0; i < 4 && el; i++) {
+      if (el.tagName === "BUTTON" || el.tagName === "A" || el.getAttribute("role") === "button") {
+        target = el;
+        break;
+      }
+      el = el.parentElement;
+    }
+    target.click();
+    return true;
+  }, period);
+
+  if (!selected) {
+    if (debug) console.warn(`  [debug] Opened the meal toggle, but couldn't find a "${period}" option to click.`);
+    return false;
+  }
+
+  await new Promise((r) => setTimeout(r, 1000)); // let the item list reload for the new period
+  return true;
 }
 
-// ---------------- Goals dialog ----------------
+// Scrapes every food item currently shown on the page (i.e. for whatever
+// meal period is active). Items already seen in an earlier period (same
+// name) reuse their cached nutrition instantly instead of repeating the
+// Add → open calculator → read → clear dance — this is both a big speed win
+// (dining halls repeat a lot of items across Lunch/Dinner) and the only
+// reason scraping three periods doesn't just take 3x as long.
+async function scrapeItemsForPeriod(page, period, debug, nutritionCache) {
+  const itemMatch = await findFirstMatch(page, SELECTORS.menuItem);
+  if (!itemMatch) {
+    console.warn(`[${period}] No menu item elements found.`);
+    return [];
+  }
 
-const goalsDialog = document.getElementById("goalsDialog");
+  const rawHandles = await page.$$(itemMatch.selector);
+  const rawNames = [];
+  for (const h of rawHandles) {
+    const name = await h.evaluate((el) => el.textContent.trim().replace(/\s+/g, " ")).catch(() => null);
+    rawNames.push(name);
+  }
+  const keptIndexes = [];
+  rawNames.forEach((name, i) => {
+    if (isLikelyFoodItem(name)) keptIndexes.push(i);
+  });
 
-document.getElementById("editGoals").addEventListener("click", () => {
-  const form = document.getElementById("goalsForm");
-  form.calorieGoal.value = state.settings.calorieGoal;
-  form.proteinGoal.value = state.settings.proteinGoal;
-  form.carbGoal.value = state.settings.carbGoal;
-  form.fatGoal.value = state.settings.fatGoal;
-  goalsDialog.showModal();
-});
-document.getElementById("closeGoals").addEventListener("click", () => goalsDialog.close());
+  console.log(`[${period}] Found ${rawHandles.length} elements, ${keptIndexes.length} look like food items.`);
 
-document.getElementById("goalsForm").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const fd = new FormData(e.target);
-  const updated = {
-    calorieGoal: Number(fd.get("calorieGoal")),
-    proteinGoal: Number(fd.get("proteinGoal")),
-    carbGoal: Number(fd.get("carbGoal")),
-    fatGoal: Number(fd.get("fatGoal")),
-  };
-  state.settings = await api("/api/settings", { method: "POST", body: JSON.stringify(updated) });
-  renderSummary();
-  goalsDialog.close();
-});
+  const items = [];
 
-// ---------------- Init ----------------
+  for (const i of keptIndexes) {
+    const name = rawNames[i];
+    if (!name) continue;
 
-loadAll().catch((err) => {
-  console.error(err);
-  document.getElementById("syncStatus").textContent = `Failed to load app data: ${err.message}`;
-});
+    const cacheKey = name.trim().toLowerCase();
+    if (nutritionCache.has(cacheKey)) {
+      // Seen this exact dish in an earlier period already — reuse it, no
+      // clicking needed.
+      items.push({ name, mealPeriod: period, ...nutritionCache.get(cacheKey) });
+      continue;
+    }
+
+    let nutrition = emptyNutrition();
+
+    try {
+      const addClicked = await page.evaluate(
+        (idx, selector) => {
+          const els = Array.from(document.querySelectorAll(selector));
+          const nameEl = els[idx];
+          if (!nameEl) return false;
+          let container = nameEl.parentElement;
+          for (let depth = 0; depth < 6 && container; depth++) {
+            const addButtons = Array.from(container.querySelectorAll('button, a, [role="button"]')).filter(
+              (el) => el.textContent && el.textContent.trim().toLowerCase() === "add"
+            );
+            if (addButtons.length === 1) {
+              addButtons[0].click();
+              return true;
+            }
+            if (addButtons.length > 1) return false;
+            container = container.parentElement;
+          }
+          return false;
+        },
+        i,
+        itemMatch.selector
+      );
+
+      if (addClicked) {
+        // Poll for the calculator to actually register the add, instead of
+        // always waiting a fixed amount — most items update almost
+        // instantly, so this only "pays" the full delay on genuinely slow
+        // renders instead of on every single item.
+        await page
+          .waitForFunction(
+            () => {
+              const regex = /^\d+\s*items?\s*\d*\s*cal/i;
+              const all = document.querySelectorAll("body *");
+              for (const el of all) {
+                if (el.children.length === 0 && el.textContent && regex.test(el.textContent.trim())) {
+                  if (!/^0\s*items?\s*0?\s*cal/i.test(el.textContent.trim())) return true;
+                }
+              }
+              return false;
+            },
+            { timeout: 1500, polling: 100 }
+          )
+          .catch(() => {}); // fall through even if it never visibly changes; the click likely still worked
+
+        const pillClicked = await clickCalculatorPill(page);
+        if (pillClicked) {
+          let bodyText = await page
+            .waitForFunction(() => document.body.innerText.includes("Summary Nutritional Information"), {
+              timeout: 1800,
+              polling: 100,
+            })
+            .then(() => page.evaluate(() => document.body.innerText))
+            .catch(() => page.evaluate(() => document.body.innerText));
+
+          const markerIdx = bodyText.indexOf("Summary Nutritional Information");
+
+          if (markerIdx !== -1) {
+            const chunk = bodyText.slice(markerIdx, markerIdx + 700);
+            nutrition = { ...nutrition, ...parseNutritionText(chunk) };
+          } else if (debug) {
+            console.warn(`  [debug] "${name}": pill clicked, but no "Summary Nutritional Information" text found afterward.`);
+          }
+
+          await clickButtonByText(page, "Clear all");
+          const okClicked = await clickButtonByText(page, "Ok");
+          if (!okClicked) await closeAnyDialog(page);
+          // Small fixed pause here is still worth keeping — this is a UI
+          // teardown step (closing/resetting) rather than something with an
+          // obvious condition to poll for.
+          await new Promise((r) => setTimeout(r, 150));
+        } else if (debug) {
+          console.warn(`  [debug] "${name}": Added, but couldn't find the calculator summary pill to click.`);
+        }
+      } else if (debug) {
+        console.warn(`  [debug] "${name}": couldn't find a scoped "Add" button for this item.`);
+      }
+    } catch (err) {
+      console.warn(`Could not read nutrition for "${name}": ${err.message}`);
+    }
+
+    if (nutrition.calories != null) {
+      nutritionCache.set(cacheKey, nutrition);
+    }
+    items.push({ name, mealPeriod: period, ...nutrition });
+  }
+
+  return items;
+}
+
+async function scrapeMenu({ debug = false } = {}) {
+  const browser = await puppeteer.launch({
+    headless: !debug,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || findLocalChrome() || undefined,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage", // avoids Chromium crashing in small/limited /dev/shm containers like Render's
+      "--disable-gpu",
+    ],
+  });
+
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1400, height: 1000 });
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    );
+
+    console.log(`Navigating to ${MENU_URL} ...`);
+    await page.goto(MENU_URL, { waitUntil: "networkidle2", timeout: 60000 });
+    // Trimmed from 3000ms — networkidle2 already means requests have quieted.
+    await new Promise((r) => setTimeout(r, 2000));
+
+    if (debug) {
+      const html = await page.content();
+      const dataDir = path.join(__dirname, "data");
+      if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(path.join(dataDir, "debug-page.html"), html, "utf-8");
+      console.log("Saved rendered HTML to data/debug-page.html for inspection.");
+
+      for (const [label, list] of Object.entries(SELECTORS)) {
+        const match = await findFirstMatch(page, list);
+        console.log(
+          match
+            ? `[${label}] matched "${match.selector}" (${match.count} elements)`
+            : `[${label}] NO MATCH from candidates: ${list.join(", ")}`
+        );
+      }
+    }
+
+    const nutritionCache = new Map();
+    const stations = [];
+
+    for (const period of MEAL_PERIODS) {
+      console.log(`\n--- ${period} ---`);
+      const switched = await switchMealPeriod(page, period, debug);
+      if (!switched) {
+        console.warn(
+          `[${period}] Couldn't confirm the meal-period switch worked — scraping whatever's ` +
+            `currently on screen and tagging it as "${period}" anyway. If this happens for every ` +
+            `period, run with --debug and check the [debug] lines above for what's not matching.`
+        );
+      }
+      const items = await scrapeItemsForPeriod(page, period, debug, nutritionCache);
+      const withNutrition = items.filter((it) => it.calories != null).length;
+      console.log(`[${period}] Captured nutrition for ${withNutrition} / ${items.length} items.`);
+      stations.push({ name: period, items });
+    }
+
+    const totalItems = stations.reduce((n, s) => n + s.items.length, 0);
+    const totalWithNutrition = stations.reduce(
+      (n, s) => n + s.items.filter((it) => it.calories != null).length,
+      0
+    );
+    console.log(`\nDone. ${totalWithNutrition} / ${totalItems} items across all three meal periods have nutrition data.`);
+    console.log(`(${nutritionCache.size} distinct dishes were fetched; repeats across periods were reused from cache.)`);
+
+    return { scrapedAt: new Date().toISOString(), stations };
+  } finally {
+    await browser.close();
+  }
+}
+
+// Allow running directly: `node scraper.js` or `node scraper.js --debug`
+if (require.main === module) {
+  const debug = process.argv.includes("--debug");
+  scrapeMenu({ debug })
+    .then((result) => {
+      const dataDir = path.join(__dirname, "data");
+      if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+      fs.writeFileSync(path.join(dataDir, "menu-cache.json"), JSON.stringify(result, null, 2));
+      console.log(`Saved to data/menu-cache.json`);
+    })
+    .catch((err) => {
+      console.error("Scrape failed:", err);
+      process.exit(1);
+    });
+}
+
+module.exports = { scrapeMenu, MENU_URL };
