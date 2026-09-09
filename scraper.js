@@ -477,9 +477,33 @@ async function scrapeMenu({ debug = false } = {}) {
     );
 
     console.log(`Navigating to ${MENU_URL} ...`);
-    await page.goto(MENU_URL, { waitUntil: "networkidle2", timeout: 60000 });
-    // Trimmed from 3000ms — networkidle2 already means requests have quieted.
-    await new Promise((r) => setTimeout(r, 2000));
+    // domcontentloaded instead of networkidle2: networkidle2 waits for the
+    // network to go quiet, which some sites (this one, apparently, at least
+    // under Render's slower/colder conditions) never fully do if they have
+    // any background polling/analytics — that made this hang all the way to
+    // the timeout ceiling instead of failing fast or succeeding. Firing as
+    // soon as the DOM is parsed and then explicitly waiting for the item
+    // list to render (below) is more reliable than waiting on network
+    // activity we don't control.
+    await page.goto(MENU_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
+    await new Promise((r) => setTimeout(r, 1500));
+
+    // Wait for the React app to actually hydrate and render menu items,
+    // rather than hoping a fixed delay was long enough — this matters more
+    // on Render, where a cold/free-tier instance can be noticeably slower
+    // than a normal laptop to finish client-side rendering.
+    await page
+      .waitForFunction(
+        () => {
+          const candidates = document.querySelectorAll('[class*="menu-item"], [class*="MenuItem"], button[class*="item"]');
+          return candidates.length > 3; // a handful of real items, not just stray matches
+        },
+        { timeout: 20000, polling: 500 }
+      )
+      .catch(() => {
+        // Fall through anyway — the debug dump and SELECTORS matching below
+        // will report clearly if the page genuinely never rendered items.
+      });
 
     if (debug) {
       const html = await page.content();
